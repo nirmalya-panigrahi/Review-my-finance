@@ -118,10 +118,27 @@ export interface MarketFetchResponse {
   requestedCount: number;
 }
 
+const BENCHMARK_SYMBOL = '^NSEI';
+/** Max symbols per proxy request, benchmark included. */
+const MAX_PROXY_SYMBOLS = 24;
+/** Alpha Vantage free tier allows 5 calls/min, benchmark included. */
+const MAX_ALPHA_VANTAGE_SYMBOLS = 5;
+
+function countResolved(seriesMap: Record<string, SymbolMarketSeries>): number {
+  return Object.values(seriesMap).filter(
+    (s) => s.source !== 'unavailable' && s.bars.length > 0
+  ).length;
+}
+
 /**
  * Fetches daily OHLC price history for symbols + ^NSEI benchmark.
  * Uses local Express Yahoo Finance proxy (/api/market/history) when available,
- * and falls back to browser-direct Alpha Vantage when running as a static site (e.g. GitHub Pages).
+ * and falls back to browser-direct Alpha Vantage when the proxy is missing
+ * (e.g. GitHub Pages) or when the proxy is up but could not resolve any ticker
+ * (e.g. Yahoo rate-limiting or blocking the server).
+ *
+ * The ^NSEI benchmark is always reserved a slot, so it is never truncated away
+ * when the user has many tickers.
  */
 export async function fetchMarketHistoryForSymbols(
   symbols: string[],
@@ -129,15 +146,16 @@ export async function fetchMarketHistoryForSymbols(
   toDate: string,
   alphaVantageKey?: string
 ): Promise<MarketFetchResponse> {
-  const uniqueSymbols = Array.from(
-    new Set([...symbols.map((s) => s.trim().toUpperCase()).filter(Boolean), '^NSEI'])
-  ).slice(0, 24);
-
-  if (uniqueSymbols.length === 0) {
-    return { provider: 'offline', seriesMap: {}, resolvedCount: 0, requestedCount: 0 };
-  }
+  const tickers = Array.from(
+    new Set(
+      symbols.map((s) => s.trim().toUpperCase()).filter((s) => s && s !== BENCHMARK_SYMBOL)
+    )
+  );
+  const uniqueSymbols = [...tickers.slice(0, MAX_PROXY_SYMBOLS - 1), BENCHMARK_SYMBOL];
+  const requestedCount = tickers.length + 1;
 
   // 1. Try Yahoo Finance proxy endpoint (available in dev/full-stack server)
+  let proxyResult: MarketFetchResponse | null = null;
   try {
     const params = new URLSearchParams({
       symbols: uniqueSymbols.join(','),
@@ -154,15 +172,16 @@ export async function fetchMarketHistoryForSymbols(
           series?: Record<string, SymbolMarketSeries>;
         };
         if (data.series) {
-          const resolvedCount = Object.values(data.series).filter(
-            (s) => s.source !== 'unavailable' && s.bars.length > 0
-          ).length;
-          return {
+          proxyResult = {
             provider: 'yahoo-finance',
             seriesMap: data.series,
-            resolvedCount,
-            requestedCount: uniqueSymbols.length,
+            resolvedCount: countResolved(data.series),
+            requestedCount,
           };
+          if (proxyResult.resolvedCount > 0) {
+            return proxyResult;
+          }
+          // Proxy is up but Yahoo returned nothing: fall through to Alpha Vantage.
         }
       }
     }
@@ -170,31 +189,33 @@ export async function fetchMarketHistoryForSymbols(
     // Backend unavailable (static hosting such as GitHub Pages); check Alpha Vantage fallback
   }
 
-  // 2. Static-mode CORS fallback via Alpha Vantage if user provided a free key
+  // 2. Static-mode / Yahoo-failure fallback via Alpha Vantage if user provided a free key
   const avKey = (alphaVantageKey ?? getStoredAlphaVantageKey()).trim();
   if (avKey) {
     const seriesMap: Record<string, SymbolMarketSeries> = {};
-    // Alpha Vantage free tier has 5 calls/min rate limit; fetch top 5 most traded symbols politely
-    const subset = uniqueSymbols.slice(0, 5);
+    // Free tier is limited to 5 calls/min: benchmark first-class, then the first tickers.
+    const subset = [...tickers.slice(0, MAX_ALPHA_VANTAGE_SYMBOLS - 1), BENCHMARK_SYMBOL];
     for (const sym of subset) {
       seriesMap[sym] = await fetchAlphaVantageSymbol(sym, avKey);
     }
-    const resolvedCount = Object.values(seriesMap).filter(
-      (s) => s.source !== 'unavailable' && s.bars.length > 0
-    ).length;
     return {
       provider: 'alpha-vantage',
       seriesMap,
-      resolvedCount,
-      requestedCount: uniqueSymbols.length,
+      resolvedCount: countResolved(seriesMap),
+      requestedCount,
     };
+  }
+
+  // 3. No key: report the proxy's (empty) result if it answered, otherwise offline.
+  if (proxyResult) {
+    return proxyResult;
   }
 
   return {
     provider: 'offline',
     seriesMap: {},
     resolvedCount: 0,
-    requestedCount: uniqueSymbols.length,
+    requestedCount,
   };
 }
 
