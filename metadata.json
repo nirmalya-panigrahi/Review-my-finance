@@ -1,0 +1,6 @@
+{
+  "name": "ArthaMetric",
+  "description": "Privacy-first behavioral finance and mathematical trade psychometrics analyzer for Zerodha, Groww, and equity broker CSVs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
